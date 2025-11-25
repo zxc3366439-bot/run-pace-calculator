@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>跑步配速训练助手（基于 VDOT）</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;}
+    body{max-width:900px;margin:28px auto;padding:16px;line-height:1.5;color:#111}
+    h1{font-size:1.6rem;margin-bottom:6px}
+    .card{border:1px solid #e6e6e6;padding:14px;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,0.03);background:#fff}
+    label{display:block;margin-top:10px;font-weight:600}
+    input,select,button{padding:8px;border-radius:6px;border:1px solid #ccc;font-size:14px}
+    .row{display:flex;gap:8px;align-items:center}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+    pre{background:#f8f8ff;padding:12px;border-radius:6px;overflow:auto}
+    table{width:100%;border-collapse:collapse;margin-top:12px}
+    th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}
+    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace}
+    .small{font-size:0.9rem;color:#555}
+    footer{margin-top:18px;font-size:0.9rem;color:#666}
+  </style>
+</head>
+<body>
+  <h1>跑步配速训练助手（基于 VDOT）</h1>
+  <div class="card">
+    <p class="small">说明：本版本使用 <strong>Jack Daniels VDOT 近似公式</strong> 由输入成绩估算 VDOT，然后根据 VDOT 计算训练区间配速。区间仅包含：E（Easy）、M（Marathon）、T（Tempo/Threshold）、I（Interval/VO2）、R（Repetition）</p>
+
+    <label>比赛/测试距离</label>
+    <div class="row">
+      <input id="distance" type="number" min="0.1" step="0.1" value="10" style="width:120px" />
+      <select id="distanceUnit">
+        <option value="km">公里 (km)</option>
+        <option value="mi">英里 (mi)</option>
+      </select>
+      <div style="margin-left:8px">填写数字 + 选择单位</div>
+    </div>
+
+    <label>成绩（时:分:秒，示例：00:42:30）</label>
+    <input id="time" placeholder="hh:mm:ss 或 mm:ss" value="00:42:30" />
+
+    <div style="margin-top:12px;display:flex;gap:8px">
+      <button id="calcBtn">计算并显示所有结果</button>
+      <button id="exampleBtn">填入示例（10km 42:30）</button>
+      <button id="copyBtn">复制结果到剪贴板</button>
+    </div>
+
+    <div id="output" style="margin-top:14px"></div>
+  </div>
+
+  <div style="margin-top:14px" class="card">
+    <h3>方法说明（摘要）</h3>
+    <ul class="small">
+      <li>使用 Daniels 提供的经验公式把比赛速度（m/min）转换为 VO₂（ml/kg/min）：<code>VO₂ = -4.60 + 0.182258*v + 0.000104*v²</code>，其中 v 为米/分钟；将其近似作为 VDOT。</li>
+      <li>给定目标 VO₂（由 VDOT * 某个系数得来），反向解出 v（速度），从而得到配速（秒/公里 或 秒/英里）。</li>
+      <li>我们选用保守且常见的 VO₂ 百分比映射：E ~ 70%，M ~ 88%，T ~ 94%，I ~ 103%，R ~ 110%。这些系数为常用近似值，实际可根据具体训练计划微调。</li>
+      <li>本工具为教学与参考用途；务必结合主观感觉、心率与教练建议调整训练强度。</li>
+    </ul>
+  </div>
+
+  <footer>如果你想要基于更精确的 VDOT 表格（逐项查表）或者允许用户选择目标距离来生成训练计划，我可以把工具进一步增强并加入导出/保存功能。</footer>
+
+  <script>
+    // ---------- 工具函数 ----------
+    function parseTimeToSeconds(str) {
+      if (!str || !str.trim()) return null;
+      const parts = str.trim().split(':').map(p => parseInt(p,10));
+      if (parts.some(isNaN)) return null;
+      if (parts.length === 1) return parts[0];
+      if (parts.length === 2) return parts[0]*60 + parts[1];
+      if (parts.length >=3) return parts[0]*3600 + parts[1]*60 + parts[2];
+      return null;
+    }
+    function secondsToTime(s){
+      if (s===null || isNaN(s)) return '--:--';
+      s = Math.round(s);
+      const h = Math.floor(s/3600); s%=3600; const m = Math.floor(s/60); const sec = s%60;
+      if (h>0) return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+      return `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
+    }
+    function formatPace(sPerUnit){
+      if (!isFinite(sPerUnit) || isNaN(sPerUnit)) return '--:--';
+      const m = Math.floor(sPerUnit/60);
+      const s = Math.round(sPerUnit%60);
+      return `${m}:${String(s).padStart(2,'0')}`;
+    }
+
+    // ---------- Daniels 近似公式（VO2 与速度的正反解） ----------
+    // VO2 = -4.60 + 0.182258*v + 0.000104*v^2, v in meters per minute
+    // 给定 v -> VO2 straightforward. 给定 VO2 -> solve quadratic for v.
+    function vo2FromSpeedMetersPerMin(v){
+      return -4.6 + 0.182258 * v + 0.000104 * v * v;
+    }
+    function speedMetersPerMinFromVO2(vo2){
+      // 0.000104*v^2 + 0.182258*v + (-4.6 - vo2) = 0
+      const a = 0.000104;
+      const b = 0.182258;
+      const c = -4.6 - vo2;
+      const disc = b*b - 4*a*c;
+      if (disc < 0) return null;
+      const v1 = (-b + Math.sqrt(disc)) / (2*a);
+      const v2 = (-b - Math.sqrt(disc)) / (2*a);
+      const v = Math.max(v1, v2);
+      return v; // meters per minute
+    }
+
+    // ---------- 估算 VDOT ----------
+    // 由输入距离（km）和时间（秒）计算 VDOT（近似等于 VO2）
+    function estimateVDOTFromPerformance(distanceKm, timeSeconds){
+      const distanceMeters = distanceKm * 1000;
+      const timeMinutes = timeSeconds / 60;
+      const v = distanceMeters / timeMinutes; // m / min
+      const vo2 = vo2FromSpeedMetersPerMin(v);
+      // Daniels 的 VDOT 也是基于 VO2，存在微小差异；这里我们直接用 vo2 近似作为 VDOT
+      const vdot = vo2;
+      return { vdot, v_m_per_min: v };
+    }
+
+    // ---------- 由 VDOT 计算各训练区间配速 ----------
+    // 使用 VO2 百分比映射为目标 VO2，然后反解速度 -> 配速
+    const ZONES = [
+      { key:'E', name:'Easy', vo2Factor:0.70, desc:'恢复与轻松跑' },
+      { key:'M', name:'Marathon', vo2Factor:0.88, desc:'马拉松训练配速' },
+      { key:'T', name:'Tempo', vo2Factor:0.94, desc:'节奏/阈值训练' },
+      { key:'I', name:'Interval', vo2Factor:1.03, desc:'间歇训练（接近或略高于 VO2max）' },
+      { key:'R', name:'Repetition', vo2Factor:1.10, desc:'短重复，速度更快，恢复充分' }
+    ];
+
+    function computeZonePacesFromVDOT(vdot){
+      // vdot ~ VO2 (ml/kg/min)
+      const results = ZONES.map(z=>{
+        const targetVO2 = vdot * z.vo2Factor;
+        const v_m_per_min = speedMetersPerMinFromVO2(targetVO2);
+        if (!v_m_per_min || v_m_per_min <= 0) return { ...z, pacePerKmSec: NaN, pacePerMileSec: NaN };
+        const secPerKm = 1000 / v_m_per_min * 60; // seconds per km
+        const secPerMile = 1609.344 / v_m_per_min * 60; // seconds per mile
+        return { ...z, pacePerKmSec: secPerKm, pacePerMileSec: secPerMile };
+      });
+      return results;
+    }
+
+    // ---------- UI 绑定 ----------
+    const distanceEl = document.getElementById('distance');
+    const distanceUnitEl = document.getElementById('distanceUnit');
+    const timeEl = document.getElementById('time');
+    const calcBtn = document.getElementById('calcBtn');
+    const exampleBtn = document.getElementById('exampleBtn');
+    const copyBtn = document.getElementById('copyBtn');
+    const outputEl = document.getElementById('output');
+
+    exampleBtn.addEventListener('click',()=>{
+      distanceEl.value = 10; distanceUnitEl.value='km'; timeEl.value='00:42:30';
+      doCalc();
+    });
+    calcBtn.addEventListener('click',doCalc);
+    copyBtn.addEventListener('click',copyResults);
+
+    let lastResultText = '';
+
+    function doCalc(){
+      outputEl.innerHTML = '';
+      const d = parseFloat(distanceEl.value);
+      const unit = distanceUnitEl.value;
+      const tStr = timeEl.value;
+      if (!d || d <= 0) { outputEl.innerHTML = `<div class="small">请输入有效距离</div>`; return; }
+      const tSec = parseTimeToSeconds(tStr);
+      if (tSec === null) { outputEl.innerHTML = `<div class="small">无法解析成绩，请使用 hh:mm:ss 或 mm:ss 格式。</div>`; return; }
+
+      const inputKm = unit === 'km' ? d : d * 1.609344;
+
+      const perf = estimateVDOTFromPerformance(inputKm, tSec);
+      const vdot = perf.vdot;
+      const v_m_per_min = perf.v_m_per_min;
+
+      // 输出头部信息
+      const header = document.createElement('div');
+      header.innerHTML = `<div class="grid">
+        <div><strong>输入成绩</strong><div class="small">距离：${d}${unit}（${inputKm.toFixed(3)} km）</div><div class="small">成绩：${secondsToTime(tSec)}</div></div>
+        <div><strong>估算 VDOT</strong><div class="small">VDOT（近似）：${vdot.toFixed(2)}</div><div class="small">平均速度：${(v_m_per_min).toFixed(1)} m/min</div></div>
+      </div>`;
+      outputEl.appendChild(header);
+
+      // 计算训练区间
+      const zones = computeZonePacesFromVDOT(vdot);
+      const zDiv = document.createElement('div');
+      zDiv.innerHTML = `<h3>训练区间（基于 VDOT=${vdot.toFixed(2)})</h3>`;
+      const table = document.createElement('table');
+      table.innerHTML = `<thead><tr><th>区间</th><th>说明</th><th>配速（每公里）</th><th>配速（每英里）</th></tr></thead>`;
+      const tbody = document.createElement('tbody');
+      zones.forEach(z =>{
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td><strong>${z.key}</strong></td>
+                        <td class="small">${z.desc}</td>
+                        <td class="mono">${isFinite(z.pacePerKmSec) ? formatPace(z.pacePerKmSec) + ' /km' : '--'}</td>
+                        <td class="mono">${isFinite(z.pacePerMileSec) ? formatPace(z.pacePerMileSec) + ' /mi' : '--'}</td>`;
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      zDiv.appendChild(table);
+      outputEl.appendChild(zDiv);
+
+      // 同时给出用 Riegel 预测表供参考（可删）
+      const predDiv = document.createElement('div');
+      predDiv.innerHTML = `<h3>参考：以当前成绩预测常见距离</h3>`;
+      const riegelTable = document.createElement('table');
+      riegelTable.innerHTML = `<thead><tr><th>距离</th><th>预计用时</th><th>预计配速/km</th></tr></thead>`;
+      const rtbody = document.createElement('tbody');
+      const STANDARD = [1,3,5,10,21.0975,42.195];
+      const exponent = 1.06;
+      STANDARD.forEach(km=>{
+        const predictSec = riegelPredict(tSec, inputKm, km, exponent);
+        const paceKm = predictSec / km;
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${km} km</td><td class="mono">${secondsToTime(predictSec)}</td><td class="mono">${formatPace(paceKm)}/km</td>`;
+        rtbody.appendChild(tr);
+      });
+      riegelTable.appendChild(rtbody);
+      predDiv.appendChild(riegelTable);
+      outputEl.appendChild(predDiv);
+
+      lastResultText = composePlainText(d,unit,tSec,inputKm,vdot,zones);
+    }
+
+    // Riegel prediction (reuse)
+    function riegelPredict(timeSeconds, fromDistanceKm, toDistanceKm, exponent=1.06){
+      return timeSeconds * Math.pow(toDistanceKm / fromDistanceKm, exponent);
+    }
+
+    function composePlainText(d,unit,tSec,inputKm,vdot,zones){
+      let out = '';
+      out += `输入： ${d}${unit} (${inputKm.toFixed(3)} km) 成绩 ${secondsToTime(tSec)}
+`;
+      out += `估算 VDOT: ${vdot.toFixed(2)}
+
+`;
+      out += `训练区间：
+`;
+      zones.forEach(z=>{
+        out += `${z.key} (${z.desc}): ${isFinite(z.pacePerKmSec) ? formatPace(z.pacePerKmSec) : '--'} /km | ${isFinite(z.pacePerMileSec) ? formatPace(z.pacePerMileSec) : '--'} /mi
+`;
+      });
+      return out;
+    }
+
+    async function copyResults(){
+      if (!lastResultText) { alert('请先点击 "计算并显示所有结果" 按钮获取结果。'); return; }
+      try{ await navigator.clipboard.writeText(lastResultText); alert('已复制到剪贴板'); }
+      catch(e){ alert('复制失败，请手动选择并复制输出内容。'); }
+    }
+
+    // 初始示例
+    doCalc();
+  </script>
+</body>
+</html>
